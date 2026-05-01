@@ -731,6 +731,288 @@ run_test "mixed_dml_wor_idx_deleted_missing" \
 rm -rf "$TMPROOT"
 
 # ============================================================
+# GUARD 18: .read interleaved indexed composite-PK tables stay isolated
+# Bug shape: switching between multiple indexed blob-key tables can
+#            corrupt deferred table/index edits across roots.
+# Invariant: per-table counts and forced indexed lookups all survive
+#            reopen exactly.
+# ============================================================
+
+echo "--- Guard 18: .read interleaved indexed composite-PK tables ---"
+
+TMPROOT=$(mktemp -d)
+DB="$TMPROOT/interleaved_idx.db"
+SQL="$TMPROOT/interleaved_idx.sql"
+
+echo "CREATE TABLE a(
+  k1 INTEGER NOT NULL,
+  k2 INTEGER NOT NULL,
+  c INTEGER,
+  v TEXT,
+  PRIMARY KEY(k1,k2)
+);
+CREATE TABLE b(
+  k1 INTEGER NOT NULL,
+  k2 INTEGER NOT NULL,
+  c INTEGER,
+  v TEXT,
+  PRIMARY KEY(k1,k2)
+);
+CREATE INDEX idx_a_v ON a(v);
+CREATE INDEX idx_b_c ON b(c);" | $DOLTLITE "$DB" > /dev/null 2>&1
+
+{
+  echo "BEGIN;"
+  for i in $(seq 1 2400); do
+    echo "INSERT INTO a VALUES($i,$i,$i,'a$i');"
+    echo "INSERT INTO b VALUES($i,$i,$i,'b$i');"
+  done
+  for i in $(seq 601 1800); do
+    echo "UPDATE a SET c=-$i, v='au$i' WHERE k1=$i AND k2=$i;"
+    echo "UPDATE b SET c=-$i, v='bu$i' WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 7 7 2400); do
+    echo "DELETE FROM a WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 11 11 2400); do
+    echo "DELETE FROM b WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 2401 3000); do
+    echo "INSERT INTO a VALUES($i,$i,$i,'taila');"
+    echo "INSERT INTO b VALUES($i,$i,$i,'tailb');"
+  done
+  echo "COMMIT;"
+} > "$SQL"
+
+$DOLTLITE -bail "$DB" -cmd ".read $SQL" \
+  "SELECT dolt_commit('-A','-m','interleaved idx');" > /dev/null 2>&1
+
+run_test "interleaved_idx_a_count" \
+  "SELECT COUNT(*) FROM a;" "2658" "$DB"
+run_test "interleaved_idx_b_count" \
+  "SELECT COUNT(*) FROM b;" "2782" "$DB"
+run_test "interleaved_idx_a_forced_v" \
+  "SELECT printf('%d|%s', c, v) FROM a INDEXED BY idx_a_v WHERE v='au1003';" "-1003|au1003" "$DB"
+run_test "interleaved_idx_b_forced_c" \
+  "SELECT v FROM b INDEXED BY idx_b_c WHERE c=-1003;" "bu1003" "$DB"
+run_test "interleaved_idx_a_deleted" \
+  "SELECT COUNT(*) FROM a WHERE k1=1400 AND k2=1400;" "0" "$DB"
+run_test "interleaved_idx_b_deleted" \
+  "SELECT COUNT(*) FROM b WHERE k1=1430 AND k2=1430;" "0" "$DB"
+run_test "interleaved_idx_a_tail_count" \
+  "SELECT COUNT(*) FROM a INDEXED BY idx_a_v WHERE v='taila';" "600" "$DB"
+
+rm -rf "$TMPROOT"
+
+# ============================================================
+# GUARD 19: .read interleaved indexed WITHOUT ROWID tables stay isolated
+# Invariant: the same cross-table indexed reopen checks work on
+#            non-rowid composite-PK layouts.
+# ============================================================
+
+echo "--- Guard 19: .read interleaved indexed WITHOUT ROWID tables ---"
+
+TMPROOT=$(mktemp -d)
+DB="$TMPROOT/interleaved_wor_idx.db"
+SQL="$TMPROOT/interleaved_wor_idx.sql"
+
+echo "CREATE TABLE a(
+  k1 INTEGER NOT NULL,
+  k2 INTEGER NOT NULL,
+  c INTEGER,
+  v TEXT,
+  PRIMARY KEY(k1,k2)
+) WITHOUT ROWID;
+CREATE TABLE b(
+  k1 INTEGER NOT NULL,
+  k2 INTEGER NOT NULL,
+  c INTEGER,
+  v TEXT,
+  PRIMARY KEY(k1,k2)
+) WITHOUT ROWID;
+CREATE INDEX idx_a_v ON a(v);
+CREATE INDEX idx_b_c ON b(c);" | $DOLTLITE "$DB" > /dev/null 2>&1
+
+{
+  echo "BEGIN;"
+  for i in $(seq 1 2100); do
+    echo "INSERT INTO a VALUES($i,$i,$i,'a$i');"
+    echo "INSERT INTO b VALUES($i,$i,$i,'b$i');"
+  done
+  for i in $(seq 401 1600); do
+    echo "UPDATE a SET c=-$i, v='awu$i' WHERE k1=$i AND k2=$i;"
+    echo "UPDATE b SET c=-$i, v='bwu$i' WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 8 8 2100); do
+    echo "DELETE FROM a WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 9 9 2100); do
+    echo "DELETE FROM b WHERE k1=$i AND k2=$i;"
+  done
+  for i in $(seq 2101 2600); do
+    echo "INSERT INTO a VALUES($i,$i,$i,'taila');"
+    echo "INSERT INTO b VALUES($i,$i,$i,'tailb');"
+  done
+  echo "COMMIT;"
+} > "$SQL"
+
+$DOLTLITE -bail "$DB" -cmd ".read $SQL" \
+  "SELECT dolt_commit('-A','-m','interleaved wor idx');" > /dev/null 2>&1
+
+run_test "interleaved_wor_idx_a_count" \
+  "SELECT COUNT(*) FROM a;" "2338" "$DB"
+run_test "interleaved_wor_idx_b_count" \
+  "SELECT COUNT(*) FROM b;" "2367" "$DB"
+run_test "interleaved_wor_idx_a_forced_v" \
+  "SELECT printf('%d|%s', c, v) FROM a INDEXED BY idx_a_v WHERE v='awu999';" "-999|awu999" "$DB"
+run_test "interleaved_wor_idx_b_forced_c" \
+  "SELECT v FROM b INDEXED BY idx_b_c WHERE c=-1000;" "bwu1000" "$DB"
+run_test "interleaved_wor_idx_a_deleted" \
+  "SELECT COUNT(*) FROM a WHERE k1=1200 AND k2=1200;" "0" "$DB"
+run_test "interleaved_wor_idx_b_deleted" \
+  "SELECT COUNT(*) FROM b WHERE k1=1800 AND k2=1800;" "0" "$DB"
+run_test "interleaved_wor_idx_b_tail_count" \
+  "SELECT COUNT(*) FROM b INDEXED BY idx_b_c WHERE c BETWEEN 2101 AND 2600;" "500" "$DB"
+
+rm -rf "$TMPROOT"
+
+# ============================================================
+# GUARD 20: .read savepoint-heavy indexed composite-PK stream
+# Invariant: savepoint release/rollback keeps both table rows and
+#            secondary indexes aligned after reopen.
+# ============================================================
+
+echo "--- Guard 20: .read savepoint-heavy indexed composite PK ---"
+
+TMPROOT=$(mktemp -d)
+DB="$TMPROOT/savepoint_idx.db"
+SQL="$TMPROOT/savepoint_idx.sql"
+
+echo "CREATE TABLE t(
+  a INTEGER NOT NULL,
+  b INTEGER NOT NULL,
+  c INTEGER,
+  d INTEGER,
+  v TEXT,
+  PRIMARY KEY(a,b)
+);
+CREATE INDEX idx_t_v ON t(v);
+CREATE INDEX idx_t_cd ON t(c,d);" | $DOLTLITE "$DB" > /dev/null 2>&1
+
+{
+  echo "BEGIN;"
+  for i in $(seq 1 1000); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'base$i');"
+  done
+  echo "SAVEPOINT sp1;"
+  for i in $(seq 1001 2000); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'keep$i');"
+  done
+  echo "RELEASE sp1;"
+  echo "SAVEPOINT sp2;"
+  for i in $(seq 2001 2600); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'drop$i');"
+  done
+  for i in $(seq 301 1500); do
+    echo "UPDATE t SET c=-$i, d=-$i, v='u$i' WHERE a=$i AND b=$i;"
+  done
+  echo "ROLLBACK TO sp2;"
+  echo "RELEASE sp2;"
+  echo "SAVEPOINT sp3;"
+  for i in $(seq 5 5 2000); do
+    echo "DELETE FROM t WHERE a=$i AND b=$i;"
+  done
+  echo "RELEASE sp3;"
+  echo "COMMIT;"
+} > "$SQL"
+
+$DOLTLITE -bail "$DB" -cmd ".read $SQL" \
+  "SELECT dolt_commit('-A','-m','savepoint idx');" > /dev/null 2>&1
+
+run_test "savepoint_idx_count" \
+  "SELECT COUNT(*) FROM t;" "1600" "$DB"
+run_test "savepoint_idx_kept" \
+  "SELECT v FROM t INDEXED BY idx_t_v WHERE v='keep1201';" "keep1201" "$DB"
+run_test "savepoint_idx_rolled_back_insert" \
+  "SELECT COUNT(*) FROM t WHERE a=2400 AND b=2400;" "0" "$DB"
+run_test "savepoint_idx_rolled_back_update" \
+  "SELECT printf('%d|%d|%s', c, d, v) FROM t INDEXED BY idx_t_cd WHERE c=1001 AND d=1001;" "1001|1001|keep1001" "$DB"
+run_test "savepoint_idx_released_insert_survives_rollback" \
+  "SELECT v FROM t INDEXED BY idx_t_v WHERE v='keep1501';" "keep1501" "$DB"
+run_test "savepoint_idx_deleted_missing" \
+  "SELECT COUNT(*) FROM t INDEXED BY idx_t_cd WHERE c=1500 AND d=1500;" "0" "$DB"
+
+rm -rf "$TMPROOT"
+
+# ============================================================
+# GUARD 21: .read savepoint-heavy indexed WITHOUT ROWID stream
+# Invariant: the same savepoint/index reopen behavior works on
+#            non-rowid composite-PK tables.
+# ============================================================
+
+echo "--- Guard 21: .read savepoint-heavy indexed WITHOUT ROWID composite PK ---"
+
+TMPROOT=$(mktemp -d)
+DB="$TMPROOT/savepoint_wor_idx.db"
+SQL="$TMPROOT/savepoint_wor_idx.sql"
+
+echo "CREATE TABLE t(
+  a INTEGER NOT NULL,
+  b INTEGER NOT NULL,
+  c INTEGER,
+  d INTEGER,
+  v TEXT,
+  PRIMARY KEY(a,b)
+) WITHOUT ROWID;
+CREATE INDEX idx_t_v ON t(v);
+CREATE INDEX idx_t_cd ON t(c,d);" | $DOLTLITE "$DB" > /dev/null 2>&1
+
+{
+  echo "BEGIN;"
+  for i in $(seq 1 900); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'base$i');"
+  done
+  echo "SAVEPOINT sp1;"
+  for i in $(seq 901 1800); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'keep$i');"
+  done
+  echo "RELEASE sp1;"
+  echo "SAVEPOINT sp2;"
+  for i in $(seq 1801 2300); do
+    echo "INSERT INTO t VALUES($i,$i,$i,$i,'drop$i');"
+  done
+  for i in $(seq 201 1300); do
+    echo "UPDATE t SET c=-$i, d=-$i, v='wu$i' WHERE a=$i AND b=$i;"
+  done
+  echo "ROLLBACK TO sp2;"
+  echo "RELEASE sp2;"
+  echo "SAVEPOINT sp3;"
+  for i in $(seq 6 6 1800); do
+    echo "DELETE FROM t WHERE a=$i AND b=$i;"
+  done
+  echo "RELEASE sp3;"
+  echo "COMMIT;"
+} > "$SQL"
+
+$DOLTLITE -bail "$DB" -cmd ".read $SQL" \
+  "SELECT dolt_commit('-A','-m','savepoint wor idx');" > /dev/null 2>&1
+
+run_test "savepoint_wor_idx_count" \
+  "SELECT COUNT(*) FROM t;" "1500" "$DB"
+run_test "savepoint_wor_idx_kept" \
+  "SELECT v FROM t INDEXED BY idx_t_v WHERE v='keep1001';" "keep1001" "$DB"
+run_test "savepoint_wor_idx_rolled_back_insert" \
+  "SELECT COUNT(*) FROM t WHERE a=2000 AND b=2000;" "0" "$DB"
+run_test "savepoint_wor_idx_rolled_back_update" \
+  "SELECT printf('%d|%d|%s', c, d, v) FROM t INDEXED BY idx_t_cd WHERE c=801 AND d=801;" "801|801|base801" "$DB"
+run_test "savepoint_wor_idx_released_insert_survives_rollback" \
+  "SELECT v FROM t INDEXED BY idx_t_v WHERE v='keep1501';" "keep1501" "$DB"
+run_test "savepoint_wor_idx_deleted_missing" \
+  "SELECT COUNT(*) FROM t INDEXED BY idx_t_cd WHERE c=1200 AND d=1200;" "0" "$DB"
+
+rm -rf "$TMPROOT"
+
+# ============================================================
 # GUARD 8: Encoding consistency (LE macros match inline code)
 # Bug: encoding was done inline with inconsistent patterns
 # Fix: shared PROLLY_GET/PUT_U16/U32 macros
